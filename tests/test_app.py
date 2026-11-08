@@ -581,6 +581,11 @@ class TestListingsTableAndFiltering:
 class TestStreamlitAppTestHeadless:
     """利用 streamlit.testing.v1.AppTest 進行全方位無頭掛載與使用者互動模擬測試。"""
 
+    @pytest.fixture(autouse=True)
+    def isolated_db(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """預設把 App 的資料庫導到 tmp_path，避免測試開啟（並 checkpoint／寫入）正式的 data/hardware.db。"""
+        monkeypatch.setenv("HARDWARE_DB_PATH", str(tmp_path / "apptest.db"))
+
     @pytest.fixture
     def app_file_path(self) -> str:
         """回傳 app/main_app.py 絕對路徑。"""

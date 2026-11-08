@@ -87,3 +87,9 @@
 - [x] 全專案回歸測試驗證（139/139 passed, 26.24s）
 - [x] 驗收評定：**PASS**
 
+### [維護] 測試隔離正式資料庫與 resanitize 售價修正（ERR-019）
+- [x] `TestRealDatabaseIntegrity` 改為預設 skip（`CHECK_REAL_DB=1` 才跑）並唯讀開啟；乾淨度不變量改在 tmp_path DB 上驗證
+- [x] AppTest 改用 tmp_path DB（`HARDWARE_DB_PATH`），全套測試不再建立或改動 `data/hardware.db`
+- [x] `resanitize_ptt_listings` 只捕捉 `RequestException`；無有效售價時略過，不再寫入 0
+- [x] 全專案回歸測試（151 passed, 1 skipped）；`ruff check .` 全過；`python -m cleaners.resanitize_db logs\smoke.db` 實跑通過
+

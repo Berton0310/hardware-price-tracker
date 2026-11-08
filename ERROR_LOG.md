@@ -359,5 +359,23 @@
 - **預防規範 (Prevention Rule)**：
   - Windows 環境下的 `.bat` 批次檔不可僅使用單純的 `python` 指令，必須實作 Conda/Miniforge/Virtualenv 多層級環境自動偵測與套件可用性驗證。
 
+---
 
+### [ERR-019] 測試直接開啟正式資料庫，關閉連線時的 WAL checkpoint 改寫 data/hardware.db
+- **記錄日期**：2026-11-08
+- **遭遇階段**：驗證 Agent / 清理 ruff 時順帶發現
+- **涉及檔案**：`tests/test_verification_acceptance.py`, `tests/test_app.py`, `cleaners/resanitize_db.py`
+- **問題現象**：
+  - `TestRealDatabaseIntegrity` 以 `sqlite3.connect("data/hardware.db")` 只做 SELECT，但資料庫是 WAL 模式，最後一條連線關閉時 SQLite 會把 `-wal` checkpoint 回主檔，主檔內容因此被改動。
+  - `TestStreamlitAppTestHeadless` 的 5 個 AppTest 沒設 `HARDWARE_DB_PATH`，App 預設開啟（不存在時建立）`data/hardware.db`；點同步按鈕的測試還可能寫入正式資料庫。
+  - 同次檢查發現 `resanitize_ptt_listings` 用 `except Exception` 吞掉所有錯誤，且以 `parsed.get("used_asking_price", 0)` 寫回 0 元售價（ERR-015 復發）。
+- **根本原因 (Root Cause)**：「只讀不寫」不代表檔案不會變：WAL 模式下一般連線關閉時會 checkpoint；App 的預設路徑指向正式資料庫。
+- **修復方案 (Resolution)**：
+  - 乾淨度不變量改在 tmp_path 暫存 DB 上跑完整清洗流程驗證；正式資料庫檢查改為預設 skip，需 `CHECK_REAL_DB=1`，並以 `file:...?mode=ro` 唯讀開啟。
+  - AppTest 類別加 autouse fixture，把 `HARDWARE_DB_PATH` 導到 tmp_path。
+  - `resanitize_ptt_listings` 只捕捉 `requests.exceptions.RequestException` 並記 warning；抓不到內文或解析不到正整數售價時略過該筆、保留原資料（欄位為 NOT NULL，不能存 None）。
+- **回歸測試**：`tests/test_verification_acceptance.py::TestReadOnlyOpen`、`TestCleanedDatabaseInvariants`；`tests/test_resanitize_db.py` 的 `test_ptt_listing_without_valid_price_is_skipped_not_zeroed`、`test_ptt_fetch_errors_are_logged_and_row_kept`、`test_ptt_unexpected_errors_are_not_swallowed`。
+- **預防規範 (Prevention Rule)**：
+  - 測試一律用 tmp_path／in-memory DB；真的要檢查正式資料庫時，預設 skip、以環境變數開啟，並用 `mode=ro` 唯讀連線。
+  - 測試 App 時一定設定 `HARDWARE_DB_PATH`。
 

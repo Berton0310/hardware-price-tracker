@@ -14,6 +14,7 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from cleaners import resanitize_db
 from cleaners.resanitize_db import resanitize_database
@@ -182,3 +183,78 @@ def test_cli_shows_progress_messages_and_summary(tmp_path: Path) -> None:
         assert prefix.strip() in terminal, (prefix, terminal)
     assert "[OK] 資料庫清洗完成！摘要：" in stdout
     assert "'total_used': 0" in stdout
+
+
+def _ptt_row(db_path: Path) -> tuple[str, int]:
+    conn = init_db(str(db_path))
+    try:
+        row = conn.execute("SELECT spec_group, used_asking_price FROM used_market_listings WHERE post_id='PTT_1';").fetchone()
+        return row[0], row[1]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("bad_price", [None, 0, -1])
+def test_ptt_listing_without_valid_price_is_skipped_not_zeroed(
+    tmp_path: Path, offline: dict, caplog: pytest.LogCaptureFixture, bad_price: int | None
+) -> None:
+    """解析不到售價時不可寫入 0（會被算進中位數，ERR-002／ERR-015），改為略過並記 warning。"""
+    db_path = tmp_path / "seeded.db"
+    _seed(db_path)
+    conn = init_db(str(db_path))
+    conn.execute("UPDATE used_market_listings SET used_asking_price = 7500 WHERE post_id='PTT_1';")
+    conn.commit()
+    conn.close()
+    parsed = {"spec_group": "RTX 3060 12G", "seller_type": "個人自售"}
+    if bad_price is not None:
+        parsed["used_asking_price"] = bad_price
+    offline["llm"].return_value = parsed
+    caplog.set_level(logging.WARNING, logger="resanitize_db")
+
+    conn = init_db(str(db_path))
+    try:
+        updated = resanitize_db.resanitize_ptt_listings(conn, delay=0)
+    finally:
+        conn.close()
+
+    assert updated == 0
+    assert _ptt_row(db_path) == ("[賣", 7500)
+    assert any("PTT_1" in r.getMessage() and "售價" in r.getMessage() for r in caplog.records)
+
+
+def test_ptt_fetch_errors_are_logged_and_row_kept(
+    tmp_path: Path, offline: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    """網路錯誤只捕捉 RequestException：重試 3 次後略過該筆、保留原資料，不用空內文重解析。"""
+    db_path = tmp_path / "seeded.db"
+    _seed(db_path)
+    offline["session"].get.side_effect = requests.exceptions.ConnectionError("boom")
+    caplog.set_level(logging.WARNING, logger="resanitize_db")
+
+    conn = init_db(str(db_path))
+    try:
+        updated = resanitize_db.resanitize_ptt_listings(conn, delay=0)
+    finally:
+        conn.close()
+
+    assert updated == 0
+    assert offline["session"].get.call_count == 3
+    offline["llm"].assert_not_called()
+    assert _ptt_row(db_path) == ("[賣", 0)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert sum("抓取失敗" in m for m in warnings) == 3
+    assert any("三次抓取皆失敗" in m for m in warnings)
+
+
+def test_ptt_unexpected_errors_are_not_swallowed(tmp_path: Path, offline: dict) -> None:
+    """非網路例外（程式錯誤）不可被吞掉。"""
+    db_path = tmp_path / "seeded.db"
+    _seed(db_path)
+    offline["fetch"].side_effect = KeyError("content")
+
+    conn = init_db(str(db_path))
+    try:
+        with pytest.raises(KeyError):
+            resanitize_db.resanitize_ptt_listings(conn, delay=0)
+    finally:
+        conn.close()

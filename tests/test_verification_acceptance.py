@@ -5,13 +5,20 @@
 2. 價格抽取準確性（PTT 1~5合售 8000、合買6000、5.3萬、售 15000、底價 12000）與排除 <= 0 貼文。
 3. 原價屋配件過濾（mini-DP $190、支架、排線過濾）。
 4. 前端下拉選單（新品+二手聯集熱門型號）與無新品指標卡優雅展示。
-5. 實體資料庫 data/hardware.db 之乾淨度（無 '[' 開頭、無 'Facebook'、無 $190 顯卡配件）。
+5. 清洗後資料庫之乾淨度（無 '[' 開頭、無 'Facebook'、無 $190 顯卡配件）：預設用 tmp_path 暫存 DB；
+   正式資料庫 data/hardware.db 只在設定 CHECK_REAL_DB=1 時以唯讀模式檢查。
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
 from pathlib import Path
+import shutil
 import sqlite3
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from analysis.price_analysis import (
     calculate_spec_group_discount,
@@ -19,6 +26,7 @@ from analysis.price_analysis import (
     evaluate_listing_price,
 )
 from app.main_app import format_metric_card_data, get_spec_groups
+from cleaners import resanitize_db
 from cleaners.llm_parser import fallback_regex_parse
 from crawlers.coolpc_crawler import parse_coolpc_html
 from database.db_manager import init_db, record_new_price, upsert_product, upsert_used_listing
@@ -318,46 +326,164 @@ class TestFrontendDropdownAndMetricCards:
         assert "已停售" in cards["card4_delta"]
 
 
-class TestRealDatabaseIntegrity:
-    """驗證 data/hardware.db 實體資料庫狀態。"""
+REAL_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "hardware.db"
 
-    def test_real_database_records(self):
-        """查詢資料庫，斷言 spec_group 以 [ 開頭筆數為 0，spec_group = 'Facebook' 筆數為 0，且無 $190 顯卡配件。"""
-        db_path = Path("data/hardware.db")
-        assert db_path.exists(), f"實體資料庫檔案 {db_path} 不存在！"
 
+def _open_read_only(db_path: Path) -> sqlite3.Connection:
+    """以 mode=ro 開啟：關閉時不會做 WAL checkpoint，不會改動資料庫檔。"""
+    return sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+
+
+def _assert_clean_invariants(conn: sqlite3.Connection) -> None:
+    """斷言 spec_group 以 [ 開頭筆數為 0、spec_group = 'Facebook' 筆數為 0，且無 $190／< $500 顯卡配件。"""
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*), GROUP_CONCAT(spec_group) FROM used_market_listings WHERE spec_group LIKE '[%';")
+    count, specs = c.fetchone()
+    assert count == 0, f"used_market_listings 存在 {count} 筆以 '[' 開頭的 spec_group: {specs}"
+
+    c.execute("SELECT COUNT(*) FROM products WHERE spec_group LIKE '[%';")
+    count = c.fetchone()[0]
+    assert count == 0, f"products 存在 {count} 筆以 '[' 開頭的 spec_group"
+
+    c.execute("SELECT COUNT(*) FROM used_market_listings WHERE LOWER(TRIM(spec_group)) = 'facebook';")
+    count = c.fetchone()[0]
+    assert count == 0, f"used_market_listings 存在 {count} 筆 spec_group = 'Facebook'"
+
+    c.execute("SELECT COUNT(*) FROM products WHERE LOWER(TRIM(spec_group)) = 'facebook';")
+    count = c.fetchone()[0]
+    assert count == 0, f"products 存在 {count} 筆 spec_group = 'Facebook'"
+
+    c.execute("""
+        SELECT COUNT(*), GROUP_CONCAT(p.model_name || ':' || h.current_new_price)
+        FROM products p
+        JOIN new_price_history h ON p.product_id = h.product_id
+        WHERE p.category = 'GPU' AND (h.current_new_price = 190 OR h.current_new_price < 500);
+    """)
+    count, items = c.fetchone()
+    assert count == 0, f"新品顯卡中存在 {count} 筆小於 $500 或等於 $190 的配件: {items}"
+
+
+def _seed_dirty_db(db_path: Path) -> None:
+    """塞入清洗前常見的髒資料：$190 GPU 轉接線、'[賣' 與 'Facebook' 標籤的二手貼文。"""
+    conn = init_db(str(db_path))
+    adapter_id = upsert_product(conn, "GPU", "RTX 3060 12G", "Leadtek", "麗臺 mini-DP 轉 DP 轉接線")
+    record_new_price(conn, adapter_id, "2026-11-01", 190, 190)
+    gpu_id = upsert_product(conn, "GPU", "RTX 3060 12G", "MSI", "MSI RTX 3060 VENTUS 2X 12G")
+    record_new_price(conn, gpu_id, "2026-11-01", 9990, 9490)
+    for post_id, platform, spec, price in [
+        ("PTT_dirty", "PTT HardwareSale", "[賣", 0),
+        ("FB_c80db8157c57", "Facebook", "Facebook", 0),
+        ("FB_noise", "FB 二手社團", "社團動態消息排序方式", 0),
+        ("FB_bracket", "FB 二手社團", "[賣] RTX 4070 12G", 17000),
+    ]:
+        upsert_used_listing(conn, {
+            "post_id": post_id,
+            "spec_group": spec,
+            "source_platform": platform,
+            "seller_name": "seller",
+            "seller_type": "個人自售",
+            "used_asking_price": price,
+            "warranty_status": "過保",
+            "sale_status": "販售中",
+            "post_time": "2026-11-01T00:00:00",
+            "post_url": f"https://example.invalid/{post_id}",
+        })
+    conn.commit()
+    conn.close()
+
+
+class TestCleanedDatabaseInvariants:
+    """在 tmp_path 暫存 DB 上跑完整清洗流程，驗證與正式資料庫相同的乾淨度不變量。"""
+
+    def test_resanitize_removes_dirty_records(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "dirty.db"
+        _seed_dirty_db(db_path)
+
+        conn = init_db(str(db_path))
+        try:
+            with pytest.raises(AssertionError):
+                _assert_clean_invariants(conn)
+        finally:
+            conn.close()
+
+        session = MagicMock()
+        session.get.return_value = MagicMock(
+            status_code=200,
+            text='<html><head><meta property="og:title" content="[賣/台北] RTX 3060 12G"></head></html>',
+        )
+        with (
+            patch.object(resanitize_db, "_get_ptt_session", return_value=session),
+            patch.object(resanitize_db, "fetch_ptt_post_details", return_value={"content": "售價 8000"}),
+            patch.object(
+                resanitize_db,
+                "parse_post_with_llm",
+                return_value={"spec_group": "[賣] RTX 3060 12G", "used_asking_price": 8000},
+            ),
+            patch.object(resanitize_db.time, "sleep"),
+        ):
+            resanitize_db.resanitize_database(str(db_path))
+
+        conn = init_db(str(db_path))
+        try:
+            _assert_clean_invariants(conn)
+        finally:
+            conn.close()
+
+
+class TestReadOnlyOpen:
+    """回歸測試：檢查正式資料庫的連線不得在關閉時 checkpoint 改動資料庫檔。"""
+
+    @staticmethod
+    def _db_with_pending_wal(tmp_path: Path) -> Path:
+        """複製一份「WAL 尚未 checkpoint、且沒有任何連線」的資料庫，模擬排程寫入後的 data/hardware.db。"""
+        src_dir, dst_dir = tmp_path / "src", tmp_path / "dst"
+        src_dir.mkdir()
+        dst_dir.mkdir()
+        writer = init_db(str(src_dir / "hardware.db"))
+        try:
+            gpu_id = upsert_product(writer, "GPU", "RTX 3060 12G", "MSI", "MSI RTX 3060 VENTUS 2X 12G")
+            record_new_price(writer, gpu_id, "2026-11-01", 9990, 9490)
+            writer.commit()
+            for suffix in ("", "-wal", "-shm"):
+                shutil.copy2(src_dir / f"hardware.db{suffix}", dst_dir / f"hardware.db{suffix}")
+        finally:
+            writer.close()
+        return dst_dir / "hardware.db"
+
+    @staticmethod
+    def _digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_plain_connect_checkpoints_on_close(self, tmp_path: Path) -> None:
+        """前提檢查：一般連線關閉時會把 WAL 寫回主檔（就是舊測試改動 data/hardware.db 的原因）。"""
+        db_path = self._db_with_pending_wal(tmp_path)
+        before = self._digest(db_path)
         conn = sqlite3.connect(str(db_path))
-        c = conn.cursor()
-
-        # 1. 斷言 used_market_listings 中 spec_group 以 [ 開頭的筆數為 0
-        c.execute("SELECT COUNT(*), GROUP_CONCAT(spec_group) FROM used_market_listings WHERE spec_group LIKE '[%';")
-        row = c.fetchone()
-        count_bracket_used = row[0]
-        assert count_bracket_used == 0, f"used_market_listings 存在 {count_bracket_used} 筆以 '[' 開頭的 spec_group: {row[1]}"
-
-        # 2. 斷言 products 中 spec_group 以 [ 開頭的筆數為 0
-        c.execute("SELECT COUNT(*) FROM products WHERE spec_group LIKE '[%';")
-        count_bracket_prod = c.fetchone()[0]
-        assert count_bracket_prod == 0, f"products 存在 {count_bracket_prod} 筆以 '[' 開頭的 spec_group"
-
-        # 3. 斷言 spec_group = 'Facebook' 筆數為 0
-        c.execute("SELECT COUNT(*) FROM used_market_listings WHERE LOWER(TRIM(spec_group)) = 'facebook';")
-        count_fb_used = c.fetchone()[0]
-        assert count_fb_used == 0, f"used_market_listings 存在 {count_fb_used} 筆 spec_group = 'Facebook'"
-
-        c.execute("SELECT COUNT(*) FROM products WHERE LOWER(TRIM(spec_group)) = 'facebook';")
-        count_fb_prod = c.fetchone()[0]
-        assert count_fb_prod == 0, f"products 存在 {count_fb_prod} 筆 spec_group = 'Facebook'"
-
-        # 4. 斷言 GPU 產品無 $190 顯卡配件或低於 500 的配件
-        c.execute("""
-            SELECT COUNT(*), GROUP_CONCAT(p.model_name || ':' || h.current_new_price)
-            FROM products p
-            JOIN new_price_history h ON p.product_id = h.product_id
-            WHERE p.category = 'GPU' AND (h.current_new_price = 190 OR h.current_new_price < 500);
-        """)
-        row_cheap = c.fetchone()
-        cheap_gpu_count = row_cheap[0]
-        assert cheap_gpu_count == 0, f"新品顯卡中存在 {cheap_gpu_count} 筆小於 $500 或等於 $190 的配件: {row_cheap[1]}"
-
+        conn.execute("SELECT COUNT(*) FROM products;").fetchone()
         conn.close()
+        assert self._digest(db_path) != before
+
+    def test_read_only_connect_leaves_db_file_unchanged(self, tmp_path: Path) -> None:
+        db_path = self._db_with_pending_wal(tmp_path)
+        before = self._digest(db_path)
+        conn = _open_read_only(db_path)
+        try:
+            _assert_clean_invariants(conn)
+            assert conn.execute("SELECT COUNT(*) FROM products;").fetchone()[0] == 1
+        finally:
+            conn.close()
+        assert self._digest(db_path) == before
+
+
+@pytest.mark.skipif(os.environ.get("CHECK_REAL_DB") != "1", reason="檢查正式資料庫需設定 CHECK_REAL_DB=1")
+class TestRealDatabaseIntegrity:
+    """驗證 data/hardware.db 實體資料庫狀態（唯讀開啟，不改動檔案）。"""
+
+    def test_real_database_records(self) -> None:
+        assert REAL_DB_PATH.exists(), f"實體資料庫檔案 {REAL_DB_PATH} 不存在！"
+        conn = _open_read_only(REAL_DB_PATH)
+        try:
+            _assert_clean_invariants(conn)
+        finally:
+            conn.close()

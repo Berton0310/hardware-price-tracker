@@ -30,6 +30,8 @@ if sys.platform == "win32":
         pass
 
 import bs4
+import requests
+
 from cleaners.llm_parser import parse_post_with_llm
 from crawlers.ptt_crawler import _get_ptt_session, _match_product_id, fetch_ptt_post_details
 from database.db_manager import init_db
@@ -79,7 +81,11 @@ def clean_polluted_products(conn: sqlite3.Connection) -> int:
 
 
 def resanitize_ptt_listings(conn: sqlite3.Connection, delay: float = 0.5) -> int:
-    """重新抓取並以升級後的 LLM/正則解析器重構 PTT 二手貼文。"""
+    """重新抓取並以升級後的 LLM/正則解析器重構 PTT 二手貼文。
+
+    抓不到內文、或解析不到正整數售價的貼文會記 warning 並略過（保留原資料），
+    回傳實際更新的筆數。
+    """
     cur = conn.execute(
         """
         SELECT post_id, post_url, used_asking_price, spec_group
@@ -96,28 +102,42 @@ def resanitize_ptt_listings(conn: sqlite3.Connection, delay: float = 0.5) -> int
         post_url = str(r[1])
         title = ""
         content = ""
+        fetched = False
 
         # 連線 PTT 抓取最新內文 (具備 3 次重試防斷線機制)
-        for attempt in range(3):
+        for attempt in range(1, 4):
             try:
                 resp = session.get(post_url, timeout=10)
                 if resp.status_code == 200:
                     soup = bs4.BeautifulSoup(resp.text, "html.parser")
                     t_meta = soup.find("meta", property="og:title")
-                    title = t_meta["content"] if t_meta else ""
+                    title = str(t_meta.get("content", "")) if t_meta else ""
                     det = fetch_ptt_post_details(post_url, session=session)
                     content = det["content"]
+                    fetched = True
                     break
-            except Exception:
+                logger.warning("PTT 貼文 %s 回應 HTTP %s（第 %d 次）: %s", post_id, resp.status_code, attempt, post_url)
+            except requests.exceptions.RequestException as exc:
+                logger.warning("PTT 貼文 %s 抓取失敗（第 %d 次）: %s (%s)", post_id, attempt, post_url, exc)
                 time.sleep(1.0)
+        time.sleep(delay)
 
-        # 若成功取得或降級為空
+        # 抓不到內文就保留原資料，不用空字串重解析去覆蓋（ERR-015）
+        if not fetched:
+            logger.warning("PTT 貼文 %s 三次抓取皆失敗，略過重解析: %s", post_id, post_url)
+            continue
+
         parsed = parse_post_with_llm(title, content)
+        price = parsed.get("used_asking_price")
+        if not isinstance(price, int) or price <= 0:
+            # used_asking_price 欄位 NOT NULL；寫入 0 會被算進中位數（ERR-002、ERR-015），故略過不更新
+            logger.warning("PTT 貼文 %s 解析不到有效售價，略過更新: used_asking_price=%r", post_id, price)
+            continue
+
         spec = parsed.get("spec_group") or "Generic-Hardware"
         if spec.startswith("["):
             spec = re.sub(r"^\[[^\]]+\]\s*", "", spec).strip() or "Generic-Hardware"
 
-        price = parsed.get("used_asking_price", 0)
         prod_id = _match_product_id(conn, spec)
         sale_status = "已售出" if re.search(r"(已售|售出|完售)", title) else "販售中"
 
@@ -145,7 +165,6 @@ def resanitize_ptt_listings(conn: sqlite3.Connection, delay: float = 0.5) -> int
             ),
         )
         updated_count += 1
-        time.sleep(delay)
 
     conn.commit()
     return updated_count
