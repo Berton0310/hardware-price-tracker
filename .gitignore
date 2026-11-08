@@ -12,6 +12,9 @@ data/*.txt
 data/*.db
 data/*.sqlite
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 
 # Python & Virtual Environments
 __pycache__/

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-import sqlite3
 import sys
 
 # 確保專案根目錄納入模組搜尋路徑

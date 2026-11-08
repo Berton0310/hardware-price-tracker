@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import sqlite3
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 import pytest
 
 from database.db_manager import get_latest_sync_log, init_db

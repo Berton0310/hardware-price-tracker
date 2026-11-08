@@ -13,9 +13,7 @@
 """
 
 import datetime
-import os
 import sqlite3
-from typing import Any
 import pytest
 
 from database.db_manager import (

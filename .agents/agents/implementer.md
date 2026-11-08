@@ -5,12 +5,9 @@ model: flash
 mainAgent: false
 subagent: true
 tools:
-  - view_file
-  - list_dir
-  - grep_search
-  - find_by_name
-  - write_to_file
-  - replace_file_content
+  - read_file
+  - write_file
+  - edit_file
   - run_command
 ---
 
@@ -31,15 +28,16 @@ tools:
 ## 交付前
 
 ```powershell
+$PY = "$env:USERPROFILE\miniforge3\python.exe"
 ruff check <你修改的檔案>
-python -m pytest tests/ -q
+& $PY -m pytest tests/ -q
 ```
 
-兩者都要通過，確保既有測試沒被你弄壞。
+兩者都要通過，確保既有測試沒被你弄壞。如果改到 CLI 腳本、`.bat`／`.ps1` 或 `app/`，還要依 `AGENTS.md` 的「實際執行驗證」實際跑一次。
 
 ## 回報格式
 
 - 修改／新增的檔案
 - 新增或變更的對外函式簽名
 - 採用的假設
-- 上面兩個指令的實際輸出（含 exit code）
+- 上面指令與實際執行驗證的輸出（含 exit code）

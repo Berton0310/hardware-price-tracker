@@ -14,8 +14,6 @@ from __future__ import annotations
 import datetime
 import os
 import sqlite3
-import subprocess
-import sys
 from typing import Any
 from unittest.mock import MagicMock, patch
 

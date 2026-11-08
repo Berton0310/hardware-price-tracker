@@ -16,7 +16,7 @@ import datetime
 import os
 import sqlite3
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 import pytest
 
 from streamlit.testing.v1 import AppTest
@@ -26,7 +26,7 @@ from database.db_manager import (
     init_db,
     record_sync_log,
 )
-from services.sync_service import DEFAULT_FB_GROUPS, execute_sync
+from services.sync_service import execute_sync
 
 
 @pytest.fixture
@@ -104,8 +104,8 @@ class TestDatabaseSyncLogsPersistence:
         t2 = "2026-11-02T14:30:00"
         t3 = "2026-11-03T18:45:00"
 
-        id1 = record_sync_log(mem_db, status="SUCCESS", details="第1次", sync_time=t1)
-        id2 = record_sync_log(mem_db, status="FAILED", details="第2次失敗", sync_time=t2)
+        record_sync_log(mem_db, status="SUCCESS", details="第1次", sync_time=t1)
+        record_sync_log(mem_db, status="FAILED", details="第2次失敗", sync_time=t2)
         id3 = record_sync_log(mem_db, status="SUCCESS", details="第3次最新", sync_time=t3)
 
         latest = get_latest_sync_log(mem_db)
@@ -116,7 +116,7 @@ class TestDatabaseSyncLogsPersistence:
         assert latest["details"] == "第3次最新"
 
         # 同秒新增兩筆時，以 log_id DESC 裁決
-        id4 = record_sync_log(mem_db, status="FAILED", details="第4次同秒競爭A", sync_time=t3)
+        record_sync_log(mem_db, status="FAILED", details="第4次同秒競爭A", sync_time=t3)
         id5 = record_sync_log(mem_db, status="SUCCESS", details="第5次同秒競爭B", sync_time=t3)
         latest_tie = get_latest_sync_log(mem_db)
         assert latest_tie is not None

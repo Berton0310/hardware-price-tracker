@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 import re
 import sqlite3
@@ -222,20 +221,20 @@ def resanitize_fb_listings(conn: sqlite3.Connection) -> int:
 
 def resanitize_database(db_path: str = DEFAULT_DB_PATH) -> dict[str, int]:
     """一鍵執行資料庫全面清洗重解析。"""
-    print(f"[*] 開始執行硬體資料庫全量清洗 (DB: {db_path})...")
+    logger.info(f"[*] 開始執行硬體資料庫全量清洗 (DB: {db_path})...")
     conn = init_db(db_path)
     try:
         # 1. 清除原價屋污染顯卡價格之轉接線配件
         deleted_prods = clean_polluted_products(conn)
-        print(f"  [1/3] 已清除 {deleted_prods} 筆非顯卡轉接線/配件資料。")
+        logger.info(f"  [1/3] 已清除 {deleted_prods} 筆非顯卡轉接線/配件資料。")
 
         # 2. 重新解析 PTT 二手貼文
         updated_ptt = resanitize_ptt_listings(conn, delay=0.4)
-        print(f"  [2/3] 已完成 {updated_ptt} 筆 PTT 貼文重構與價格回填。")
+        logger.info(f"  [2/3] 已完成 {updated_ptt} 筆 PTT 貼文重構與價格回填。")
 
         # 3. 清洗與修復 FB 二手貼文
         updated_fb = resanitize_fb_listings(conn)
-        print(f"  [3/3] 已完成 {updated_fb} 筆 FB 貼文標籤與價格修復。")
+        logger.info(f"  [3/3] 已完成 {updated_fb} 筆 FB 貼文標籤與價格修復。")
 
         return {
             "deleted_products": deleted_prods,
@@ -249,5 +248,6 @@ def resanitize_database(db_path: str = DEFAULT_DB_PATH) -> dict[str, int]:
 
 if __name__ == "__main__":
     db_file = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DB_PATH
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     res = resanitize_database(db_file)
-    print("\n[OK] 資料庫清洗完成！摘要：", res)
+    print("\n[OK] 資料庫清洗完成！摘要：", res)  # noqa: T201

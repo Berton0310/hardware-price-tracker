@@ -18,8 +18,6 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from cleaners.llm_parser import fallback_regex_parse, parse_post_with_llm
 
 

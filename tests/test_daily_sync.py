@@ -6,18 +6,13 @@
 
 from __future__ import annotations
 
-import logging
-import os
 from pathlib import Path
 import sqlite3
 import subprocess
-import sys
-from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from database.db_manager import init_db
 from scripts.daily_sync import (
     DEFAULT_COOKIE_PATH,
     DEFAULT_DB_PATH,

@@ -20,18 +20,18 @@
 | `docs/` | 規格與進度，入口是 `docs/index.md` |
 | `data/` | SQLite 資料庫檔（已被 `.gitignore` 排除） |
 
-## 指令（PowerShell，Python 3.12）
+## 指令（PowerShell）
 
-這台機器有多個 Python（ERR-018），先啟用專案環境，再一律用 `python -m` 呼叫工具。
+這台機器有多個 Python，PATH 上的 `python` 是沒有安裝專案套件的系統 Python（ERR-018）。專案環境依 `start_project.bat` 的偵測順序：`.venv` → `venv` → `~/miniforge3` → `~/miniconda3` → `~/anaconda3`。目前是 `~/miniforge3`（Python 3.13）。下面的 `$PY` 指的就是它：
 
 ```powershell
-pip install -r requirements.txt
-playwright install chromium
-python -m pytest tests/ -v
-python -m pytest tests/test_crawlers.py -v
+$PY = "$env:USERPROFILE\miniforge3\python.exe"
+& $PY -m pip install -r requirements.txt
+& $PY -m playwright install chromium
+& $PY -m pytest tests/ -v
+& $PY -m pytest tests/test_crawlers.py -v
 ruff check .
-streamlit run app/main_app.py
-python run_pipeline.py --help
+& $PY run_pipeline.py --help
 ```
 
 ## 寫程式的原則
@@ -44,6 +44,38 @@ python run_pipeline.py --help
 - 單筆資料解析失敗時，回傳 `None` 或跳過該筆，並用 `logging` 記下欄位與原始值。不要用 `0` 當預設價格：`0` 會被算進中位數與百分位，扭曲分析結果（ERR-002、ERR-015）。
 - 函式庫模組用 `logging`。只有 CLI 入口（`run_pipeline.py`、`login_fb.py`、`scripts/`）可以 `print`。
 - 原價屋頁面用 `cp950` 解碼（cp950 是 Big5 的超集，用 `big5` 會遇到缺字）；其他檔案與模組一律 `utf-8`。
+
+## 實際執行驗證
+
+pytest 通過不代表程式真的能跑起來：測試用的是 mock，實際執行時才會碰到 Python 環境、編碼、工作目錄、換行符號這類問題（ERR-011、ERR-012、ERR-017、ERR-018）。所以只要改到「會被人直接執行」的東西，交付前就要實際跑一次並讀完輸出：
+
+| 改到的東西 | 怎麼驗證 | 正常的標準 |
+| :--- | :--- | :--- |
+| CLI 腳本（`run_pipeline.py`、`scripts/*.py`、`login_fb.py`） | 用 `$PY` 執行一個安全的指令（`--help`，或指定暫存資料庫 `--db logs\smoke.db`） | exit code 為 0；輸出沒有 Traceback、亂碼或 `UnicodeEncodeError` |
+| `.bat`、`.ps1` | 實際執行一次 | 顯示的 Python 路徑正確；沒有語法錯誤或中文亂碼 |
+| Streamlit（`app/`） | 用下面的啟動腳本開起來，確認健康檢查回應後關掉 | `/_stcore/health` 回 `ok`、首頁回 200、stderr 沒有 Traceback |
+
+```powershell
+$PY = "$env:USERPROFILE\miniforge3\python.exe"
+$env:HARDWARE_DB_PATH = "logs\smoke_app.db"   # 不碰 data/ 的正式資料庫
+$p = Start-Process $PY -ArgumentList "-m","streamlit","run","app/main_app.py","--server.headless","true","--server.address","127.0.0.1","--server.port","8599" -PassThru -WindowStyle Hidden -RedirectStandardOutput logs\streamlit.out -RedirectStandardError logs\streamlit.err
+$ok = $false
+foreach ($i in 1..30) { Start-Sleep -Milliseconds 500; try { if ((Invoke-WebRequest http://127.0.0.1:8599/_stcore/health -UseBasicParsing -TimeoutSec 2).Content -eq "ok") { $ok = $true; break } } catch {} }
+"health ok: $ok"
+(Invoke-WebRequest http://127.0.0.1:8599/ -UseBasicParsing).StatusCode
+Stop-Process -Id $p.Id -Force
+Get-Content logs\streamlit.err
+Remove-Item Env:HARDWARE_DB_PATH; Remove-Item logs\smoke_app.db*, logs\streamlit.* -ErrorAction SilentlyContinue
+```
+
+用 `127.0.0.1`，不要用 `localhost`：Windows 會先試 IPv6 的 `::1`，大約 2 秒後才退回 IPv4，健康檢查會一直逾時而誤判失敗。
+
+- 健康檢查只能證明伺服器有起來。頁面腳本本身有沒有出錯，要靠 `tests/test_app.py` 的 `AppTest`，或用瀏覽器實際打開頁面確認。
+- 開起來的服務驗證完一定要關掉，不要留在背景佔用連接埠。
+- 輸出要真的讀過，不能只看 exit code：有些錯誤只會印警告，exit code 仍然是 0。
+- 會連網爬取或寫入 `data/` 正式資料庫的指令（`--sync-*`、`--all`、`login_fb.py`），不能自己跑；要先取得使用者同意，或改用 `--db logs\smoke.db` 這類暫存資料庫。
+- 在 pipe 裡截斷輸出（例如 `| Select-Object -First 3`）會讓 exit code 變成 -1。要看 exit code 時，先把輸出存進變數再看。
+- 回報時附上實際執行的指令、exit code 與關鍵輸出。
 
 ## 爬蟲與機密資料
 

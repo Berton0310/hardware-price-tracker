@@ -10,10 +10,8 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import sqlite3
-import pytest
 
 from analysis.price_analysis import (
     calculate_spec_group_discount,

@@ -5,12 +5,9 @@ model: pro
 mainAgent: false
 subagent: true
 tools:
-  - view_file
-  - list_dir
-  - grep_search
-  - find_by_name
-  - write_to_file
-  - replace_file_content
+  - read_file
+  - write_file
+  - edit_file
   - run_command
 ---
 
@@ -43,14 +40,18 @@ tools:
 ## 執行
 
 ```powershell
-python -m pytest tests/ -v
-ruff check <被修改的生產程式檔>
+$PY = "$env:USERPROFILE\miniforge3\python.exe"
+& $PY -m pytest tests/ -v
+ruff check <被修改的檔案>
 ```
+
+接著依 `AGENTS.md` 的「實際執行驗證」，把被修改的 CLI 腳本、`.bat`／`.ps1` 實際跑一次；改到 `app/` 時要把 Streamlit 開起來，確認健康檢查回應後再關掉。pytest 全過但實際執行失敗，判決就是 FAIL。
 
 ## 回報格式
 
 - 判決：PASS 或 FAIL
 - pytest 的 exit code 與通過／失敗數
+- 實際執行驗證：執行的指令、exit code、關鍵輸出
 - 新增的測試清單
 - 每個失敗案例：測試名稱、預期與實際結果、stack trace 原文
 - 規格不清楚的地方（不要自行假設，列給協調者決定）

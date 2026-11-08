@@ -33,6 +33,7 @@ Compare-Object (Import-Csv logs\tests_snapshot.csv) (Get-ChildItem tests -Recurs
 
 ## 4. 判決
 
+- verifier 的回報裡一定要有「實際執行驗證」的指令與輸出（改到 CLI、`.bat`／`.ps1` 或 `app/` 時）。缺了就退回補做。
 - **PASS**：verifier 新增的測試留在 `tests/` 當回歸測試；更新 `docs/progress.md`；向使用者回報結果與採用的假設。
 - **FAIL**：把 verifier 回報的失敗案例與 stack trace 原文交給 implementer 修正，再重跑第 2、3 步。
 - 同一個問題來回 3 輪仍然失敗：停下來，向使用者回報目前狀態與卡住的原因，由使用者決定下一步。
