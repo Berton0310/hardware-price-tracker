@@ -1,0 +1,28 @@
+# Environment variables & API keys
+.env
+*.env
+
+# Authentication & Sensitive cookies
+fb_cookies.json
+*cookie*.json
+*cookie*.txt
+data/*.txt
+
+# Database & SQLite files
+data/*.db
+data/*.sqlite
+*.db
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV/
+
+# Testing & Logs
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+logs/

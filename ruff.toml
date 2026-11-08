@@ -1,0 +1,11 @@
+target-version = "py312"
+
+[lint]
+# F：未使用的 import／變數、未定義名稱等；T20：print
+select = ["F", "T20"]
+
+[lint.per-file-ignores]
+"run_pipeline.py" = ["T20"]
+"login_fb.py" = ["T20"]
+"scripts/**" = ["T20"]
+"tests/**" = ["T20"]
