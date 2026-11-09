@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import random
 import re
 import sqlite3
@@ -19,6 +20,8 @@ import requests
 
 from cleaners.llm_parser import parse_post_with_llm
 from database.db_manager import upsert_used_listing
+
+logger = logging.getLogger(__name__)
 
 PTT_BASE_URL = "https://www.ptt.cc"
 HARDWARESALE_URL = f"{PTT_BASE_URL}/bbs/HardwareSale/index.html"
@@ -50,7 +53,8 @@ def parse_ptt_date(date_str: str) -> str:
     try:
         dt = datetime.datetime.strptime(cleaned, "%a %b %d %H:%M:%S %Y")
         return dt.isoformat()
-    except Exception:
+    except ValueError:
+        logger.warning("PTT 日期解析失敗，改用現在時間：%r", date_str)
         return datetime.datetime.now().isoformat()
 
 
@@ -191,7 +195,8 @@ def sync_ptt_to_db(
     for page_idx in range(max_pages):
         try:
             html, prev_url = fetch_ptt_page(current_url, session=session)
-        except Exception:
+        except requests.exceptions.RequestException as e:
+            logger.warning("抓取 PTT 列表頁失敗 (%s)：%s", current_url, e)
             break
 
         posts = parse_ptt_post_list(html)
@@ -207,7 +212,8 @@ def sync_ptt_to_db(
             # 抓取詳細文章內容
             try:
                 details = fetch_ptt_post_details(p["post_url"], session=session)
-            except Exception:
+            except requests.exceptions.RequestException as e:
+                logger.warning("抓取 PTT 文章內文失敗 (%s)：%s", p["post_url"], e)
                 continue
 
             # 結構化解析 (LLM 或 Fallback Regex)

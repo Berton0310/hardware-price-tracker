@@ -16,7 +16,12 @@
 from __future__ import annotations
 
 import json
+import logging
+from typing import Any
 from unittest.mock import MagicMock, patch
+
+import pytest
+import requests
 
 from cleaners.llm_parser import fallback_regex_parse, parse_post_with_llm
 
@@ -131,7 +136,10 @@ class TestParsePostWithLLM:
     def test_api_network_error_fallback(self):
         """當 API 調用發生網路異常或超時，自動降級為正則備援。"""
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-fake-key"}):
-            with patch("requests.post", side_effect=Exception("Connection timed out")):
+            with patch(
+                "requests.post",
+                side_effect=requests.exceptions.ConnectionError("Connection timed out"),
+            ):
                 res = parse_post_with_llm(
                     title="[賣/新竹/店到店] 金士頓 DDR5-5600 32G",
                     content="◎硬體型號：Kingston DDR5-5600 32G\n◎欲售價格：2600\n◎品樣狀況：過保",
@@ -207,3 +215,184 @@ class TestParsePostWithLLM:
                 assert res["used_asking_price"] == 10500
                 assert res["warranty_status"] == "原廠保內"
                 assert res["trade_method"] == "雙北面交 / 賣貨便"
+
+
+# ==============================================================================
+# parse_post_with_llm 例外處理兩層規則回歸測試（只捕捉具體例外、失敗要記 warning）
+# ==============================================================================
+
+_LLM_LOGGER = "cleaners.llm_parser"
+_TITLE = "[賣/新竹/店到店] 金士頓 DDR5-5600 32G"
+_CONTENT = "◎硬體型號：Kingston DDR5-5600 32G\n◎欲售價格：2600\n◎品樣狀況：過保"
+
+
+def _ok_resp(llm_content: Any) -> MagicMock:
+    """建立 status 200、choices[0].message.content 為指定內容的 mock 回應。"""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"choices": [{"message": {"content": llm_content}}]}
+    return resp
+
+
+def _call_llm(**post_kwargs: Any) -> dict[str, Any]:
+    """在假 API key 下呼叫 parse_post_with_llm，requests.post 以 post_kwargs 設定的 mock 取代。"""
+    with patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-fake-key"}):
+        with patch("requests.post", **post_kwargs) as mock_post:
+            res = parse_post_with_llm(title=_TITLE, content=_CONTENT)
+            assert mock_post.called
+            return res
+
+
+def _llm_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == _LLM_LOGGER and r.levelno >= logging.WARNING]
+
+
+class TestParsePostWithLLMExceptionHandling:
+    """LLM 失敗時回傳 fallback_regex_parse 結果並記 warning；非預期例外不得被吞掉。"""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            requests.exceptions.ConnectionError("Connection refused"),
+            requests.exceptions.Timeout("Read timed out"),
+            requests.exceptions.SSLError("bad handshake"),
+        ],
+        ids=["ConnectionError", "Timeout", "SSLError"],
+    )
+    def test_request_exception_falls_back_with_warning(
+        self, exc: Exception, caplog: pytest.LogCaptureFixture
+    ):
+        """requests 的各種網路例外 → 回傳與 fallback_regex_parse 完全相同的結果，並記 warning（含錯誤訊息）。"""
+        caplog.set_level(logging.WARNING, logger=_LLM_LOGGER)
+        res = _call_llm(side_effect=exc)
+        assert res == fallback_regex_parse(_TITLE, _CONTENT)
+        warnings = _llm_warnings(caplog)
+        assert warnings, "網路錯誤降級時沒有記 warning（靜默失敗）"
+        assert str(exc) in warnings[0].getMessage()
+
+    @pytest.mark.parametrize("status", [404, 429, 500], ids=["404-model-gone", "429", "500"])
+    def test_non_200_falls_back_with_warning(
+        self, status: int, caplog: pytest.LogCaptureFixture
+    ):
+        """非 200（含 ERR-013 的模型失效 404）→ 回傳 fallback 結果，且要記 warning，不能靜默。"""
+        caplog.set_level(logging.WARNING, logger=_LLM_LOGGER)
+        resp = MagicMock()
+        resp.status_code = status
+        resp.text = "error"
+        res = _call_llm(return_value=resp)
+        assert res == fallback_regex_parse(_TITLE, _CONTENT)
+        assert _llm_warnings(caplog), f"HTTP {status} 降級為 fallback 時沒有記 warning（靜默失敗）"
+
+    def test_response_body_not_json_falls_back_with_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """resp.json() 拋 requests 的 JSONDecodeError（ValueError 子類）→ fallback + warning。"""
+        caplog.set_level(logging.WARNING, logger=_LLM_LOGGER)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.side_effect = requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0)
+        res = _call_llm(return_value=resp)
+        assert res == fallback_regex_parse(_TITLE, _CONTENT)
+        assert _llm_warnings(caplog)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},  # 缺 choices → KeyError
+            {"error": {"message": "rate limited"}},  # OpenRouter 錯誤 payload → KeyError
+            {"choices": []},  # 空 choices → IndexError
+            {"choices": [{"message": {}}]},  # 缺 content → KeyError
+            {"choices": [{"message": {"content": None}}]},  # content 為 None → AttributeError
+            {"choices": None},  # choices 為 None → TypeError
+        ],
+        ids=["no-choices", "error-payload", "empty-choices", "no-content", "content-None", "choices-None"],
+    )
+    def test_malformed_api_payload_falls_back_with_warning(
+        self, body: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ):
+        """API 回傳結構不完整（KeyError／IndexError／TypeError／AttributeError）→ fallback + warning。"""
+        caplog.set_level(logging.WARNING, logger=_LLM_LOGGER)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = body
+        res = _call_llm(return_value=resp)
+        assert res == fallback_regex_parse(_TITLE, _CONTENT)
+        assert _llm_warnings(caplog)
+
+    @pytest.mark.parametrize(
+        "llm_content",
+        [
+            "This is definitely not a JSON object.",  # 非 JSON → JSONDecodeError
+            '[{"spec_group": "DDR5-5600 32G"}]',  # JSON 陣列 → list 沒有 .get
+            '"DDR5-5600 32G"',  # JSON 字串
+            "12345",  # JSON 數字
+            "null",  # JSON null
+            "```json\n[1, 2, 3]\n```",  # code fence 包著的陣列
+            '{"used_asking_price": "面議"}',  # 價格不是數字 → int() ValueError
+            '{"used_asking_price": [2600]}',  # 價格是陣列 → int() TypeError
+        ],
+        ids=["not-json", "json-array", "json-string", "json-number", "json-null",
+             "fenced-array", "price-text", "price-list"],
+    )
+    def test_llm_content_not_usable_dict_falls_back_with_warning(
+        self, llm_content: str, caplog: pytest.LogCaptureFixture
+    ):
+        """LLM 回傳非 dict 或欄位型別錯誤 → 整筆退回 fallback 結果並記 warning，不崩潰。"""
+        caplog.set_level(logging.WARNING, logger=_LLM_LOGGER)
+        res = _call_llm(return_value=_ok_resp(llm_content))
+        assert res == fallback_regex_parse(_TITLE, _CONTENT)
+        assert _llm_warnings(caplog)
+
+    def test_llm_price_infinity_falls_back_with_warning(self, caplog: pytest.LogCaptureFixture):
+        """json 接受 Infinity，int(inf) 拋 OverflowError → 退回 fallback 並記 warning，不中止整批同步。"""
+        caplog.set_level(logging.WARNING, logger=_LLM_LOGGER)
+        res = _call_llm(return_value=_ok_resp('{"used_asking_price": Infinity}'))
+        assert res == fallback_regex_parse(_TITLE, _CONTENT)
+        assert _llm_warnings(caplog)
+
+    def test_unexpected_exception_from_requests_propagates(self):
+        """非預期例外（例如 RuntimeError，代表程式 bug）不在捕捉清單內，必須往外拋而不是被吞成 fallback。"""
+        with pytest.raises(RuntimeError, match="boom"):
+            _call_llm(side_effect=RuntimeError("boom"))
+
+    def test_unexpected_exception_while_reading_response_propagates(self):
+        """解析回應時發生非預期例外（例如 RuntimeError）也要往外拋。"""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.side_effect = RuntimeError("decoder bug")
+        with pytest.raises(RuntimeError, match="decoder bug"):
+            _call_llm(return_value=resp)
+
+    def test_success_path_does_not_warn(self, caplog: pytest.LogCaptureFixture):
+        """正常回傳有效 JSON 時不應記任何 warning（避免誤報）。"""
+        caplog.set_level(logging.WARNING, logger=_LLM_LOGGER)
+        llm_json = {"category": "RAM", "spec_group": "DDR5-5600 32G", "used_asking_price": 2550}
+        res = _call_llm(return_value=_ok_resp(json.dumps(llm_json)))
+        assert res["spec_group"] == "DDR5-5600 32G"
+        assert res["used_asking_price"] == 2550
+        assert _llm_warnings(caplog) == []
+
+    def test_llm_zero_price_uses_fallback_price(self):
+        """LLM 回傳 0（未開價）但內文有價格 → 採用 fallback 解析出的 2600，不把真實價格變成 0（ERR-002）。"""
+        llm_json = {"category": "RAM", "spec_group": "DDR5-5600 32G", "used_asking_price": 0}
+        res = _call_llm(return_value=_ok_resp(json.dumps(llm_json)))
+        assert res["used_asking_price"] == 2600
+
+    def test_llm_and_fallback_both_no_price_keeps_zero(self):
+        """LLM 與 fallback 都解析不到價格 → 存 0（未開價標記，ERR-015），型別為 int、不是 None。"""
+        llm_json = {"category": "RAM", "spec_group": "DDR5-5600 32G", "used_asking_price": None}
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-fake-key"}):
+            with patch("requests.post", return_value=_ok_resp(json.dumps(llm_json))):
+                res = parse_post_with_llm(
+                    title="[賣/新竹/店到店] 金士頓 DDR5-5600 32G",
+                    content="◎硬體型號：Kingston DDR5-5600 32G\n◎品樣狀況：過保，價格私訊",
+                )
+        assert res["used_asking_price"] == 0
+        assert isinstance(res["used_asking_price"], int)
+
+    def test_requests_post_called_with_timeout(self):
+        """網路請求一定要帶 timeout（AGENTS.md）。"""
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-fake-key"}):
+            with patch("requests.post", return_value=_ok_resp("{}")) as mock_post:
+                parse_post_with_llm(title=_TITLE, content=_CONTENT, timeout=7)
+        assert mock_post.call_args.kwargs.get("timeout") == 7

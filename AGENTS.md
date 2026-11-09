@@ -40,8 +40,13 @@ ruff check .
 - 模組結構已經混亂時，重寫該模組比疊加補丁好，但要保持對外函式簽名不變、既有測試仍然通過。需要改簽名時先問使用者。
 - 修改過的檔案要讓 `ruff check <檔案>` 沒有錯誤（未使用的 import／變數、`print`）。
 - 模組對外公開的函式要標註參數與回傳型別。
-- 網路請求一定設 `timeout`，只捕捉具體例外（如 `requests.exceptions.RequestException`、Playwright 的 `TimeoutError`），不寫 `except: pass`。
-- 單筆資料解析失敗時，回傳 `None` 或跳過該筆，並用 `logging` 記下欄位與原始值。不要用 `0` 當預設價格：`0` 會被算進中位數與百分位，扭曲分析結果（ERR-002、ERR-015）。
+- 網路請求一定設 `timeout`。
+- 例外處理分兩層：
+  - 函式內部只捕捉具體例外，例如 `requests.exceptions.RequestException`、Playwright 的 `Error`／`TimeoutError`、`ValueError`、`sqlite3.Error`。
+  - 「邊界」可以捕捉 `Exception`，讓單一來源失敗不會拖垮整批：`services/` 裡每個資料來源的同步、CLI 入口、UI 的事件處理與資料載入、整次爬取。但一定要用 `logger.exception`／`logger.warning`（含錯誤訊息）記錄，或顯示給使用者，不能 `pass`。
+  - 只有「失敗了也無所謂」的動作（例如設定 stdout 編碼、關閉彈窗）可以略過，而且仍然只捕捉具體例外。
+- 價格：`used_asking_price` 欄位是 NOT NULL，`0` 代表「未開價」。分析與 UI 計算前一律剔除 `<= 0`（ERR-015）。新抓到的刊登解析不到價格時存 `0`；重新清洗既有資料時，不得把已有的價格覆蓋成 `0`（ERR-019）。
+- 其他欄位解析失敗時，回傳 `None` 或跳過該筆，並用 `logging` 記下欄位與原始值。要特別防止真實價格被解析錯成 `0`（ERR-002）。
 - 函式庫模組用 `logging`。只有 CLI 入口（`run_pipeline.py`、`login_fb.py`、`scripts/`）可以 `print`。
 - 原價屋頁面用 `cp950` 解碼（cp950 是 Big5 的超集，用 `big5` 會遇到缺字）；其他檔案與模組一律 `utf-8`。
 

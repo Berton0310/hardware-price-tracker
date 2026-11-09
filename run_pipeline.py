@@ -20,7 +20,7 @@ if sys.platform == "win32":
             sys.stdout.reconfigure(encoding="utf-8")
         if hasattr(sys.stderr, "reconfigure"):
             sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
+    except (AttributeError, OSError, ValueError):
         pass
 
 # 確保專案根目錄納入模組搜尋路徑

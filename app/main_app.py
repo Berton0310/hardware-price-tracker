@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -20,6 +21,7 @@ if _PROJECT_ROOT not in sys.path:
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 
 from analysis.price_analysis import (
     analyze_new_price_trend,
@@ -30,6 +32,8 @@ from analysis.price_analysis import (
 from cleaners.llm_parser import _extract_category
 from database.db_manager import get_latest_sync_log, init_db
 from services.sync_service import execute_sync
+
+logger = logging.getLogger(__name__)
 
 # 核心常數設定
 CATEGORIES: list[str] = ["GPU", "RAM", "SSD", "CPU"]
@@ -89,6 +93,7 @@ def get_spec_groups(conn: sqlite3.Connection, category: str) -> list[str]:
             return DEFAULT_SPEC_GROUPS.get(category, ["RTX 4060 Ti 16G"])
         return sorted(list(all_groups))
     except Exception:
+        logger.exception("載入規格群組失敗，改用預設清單")
         return DEFAULT_SPEC_GROUPS.get(category, ["RTX 4060 Ti 16G"])
 
 
@@ -136,6 +141,7 @@ def get_representative_product(
             }
         return None
     except Exception:
+        logger.exception("載入新品價格資訊失敗")
         return None
 
 
@@ -186,6 +192,7 @@ def get_filtered_listings(
             filtered.append(r)
         return filtered
     except Exception:
+        logger.exception("載入二手刊登資料失敗")
         return []
 
 
@@ -646,7 +653,7 @@ def main(db_path: str = "data/hardware.db") -> None:
             layout="wide",
             page_icon="💻",
         )
-    except Exception:
+    except StreamlitAPIException:
         pass
 
     st.title("💻 電腦硬體新品與二手市場比價分析系統")

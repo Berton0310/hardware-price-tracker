@@ -11,14 +11,18 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
+import subprocess
+import sys
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import plotly.graph_objects as go
 import pytest
+from streamlit.errors import StreamlitAPIException
 from streamlit.testing.v1 import AppTest
 
 from app.main_app import (
@@ -740,4 +744,189 @@ class TestStreamlitAppTestHeadless:
             at.sidebar.selectbox[0].select("RAM")
             at.run()
             assert mock_sync.call_count == 1
+
+
+# ==============================================================================
+# 6. 例外處理兩層規則：資料載入邊界要 logger.exception、回傳預設值；set_page_config 只吞 StreamlitAPIException
+# ==============================================================================
+
+_APP_LOGGER = "app.main_app"
+
+
+def _app_errors(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == _APP_LOGGER and r.levelno == logging.ERROR]
+
+
+def _closed_conn() -> sqlite3.Connection:
+    conn = init_db(":memory:")
+    conn.close()
+    return conn
+
+
+def _no_schema_conn() -> sqlite3.Connection:
+    """沒有建表的連線：查詢會拋 sqlite3.OperationalError（no such table）。"""
+    return sqlite3.connect(":memory:")
+
+
+def _broken_conn() -> MagicMock:
+    """execute 一律拋 sqlite3.DatabaseError（模擬資料庫檔損毀）。"""
+    conn = MagicMock(spec=sqlite3.Connection)
+    conn.execute.side_effect = sqlite3.DatabaseError("database disk image is malformed")
+    return conn
+
+
+_BAD_CONNS = {
+    "closed": _closed_conn,
+    "no-schema": _no_schema_conn,
+    "malformed": _broken_conn,
+}
+
+
+class TestDataLoaderBoundaryLogging:
+    """get_spec_groups／get_representative_product／get_filtered_listings 是 UI 資料載入邊界。"""
+
+    @pytest.mark.parametrize("make_conn", list(_BAD_CONNS.values()), ids=list(_BAD_CONNS))
+    @pytest.mark.parametrize("category", ["GPU", "RAM", "SSD", "CPU", "UNKNOWN"])
+    def test_get_spec_groups_db_error_returns_defaults_and_logs(
+        self, make_conn, category: str, caplog: pytest.LogCaptureFixture
+    ):
+        """資料庫出錯 → 回傳原本的預設清單，並有 ERROR 等級（含 traceback）紀錄。"""
+        caplog.set_level(logging.ERROR, logger=_APP_LOGGER)
+        res = get_spec_groups(make_conn(), category)
+        assert res == DEFAULT_SPEC_GROUPS.get(category, ["RTX 4060 Ti 16G"])
+        errors = _app_errors(caplog)
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None
+        assert isinstance(errors[0].exc_info[1], sqlite3.Error)
+
+    @pytest.mark.parametrize("make_conn", list(_BAD_CONNS.values()), ids=list(_BAD_CONNS))
+    def test_get_representative_product_db_error_returns_none_and_logs(
+        self, make_conn, caplog: pytest.LogCaptureFixture
+    ):
+        """資料庫出錯 → 回傳 None（與「查無產品」相同語意），並有 ERROR 紀錄。"""
+        caplog.set_level(logging.ERROR, logger=_APP_LOGGER)
+        assert get_representative_product(make_conn(), "RTX 4060 Ti 16G") is None
+        errors = _app_errors(caplog)
+        assert len(errors) == 1 and errors[0].exc_info is not None
+
+    @pytest.mark.parametrize("make_conn", list(_BAD_CONNS.values()), ids=list(_BAD_CONNS))
+    def test_get_filtered_listings_db_error_returns_empty_and_logs(
+        self, make_conn, caplog: pytest.LogCaptureFixture
+    ):
+        """資料庫出錯 → 回傳 []，並有 ERROR 紀錄。"""
+        caplog.set_level(logging.ERROR, logger=_APP_LOGGER)
+        res = get_filtered_listings(make_conn(), "RTX 4060 Ti 16G", exclude_workshops=True, only_in_warranty=True)
+        assert res == []
+        errors = _app_errors(caplog)
+        assert len(errors) == 1 and errors[0].exc_info is not None
+
+    def test_loaders_on_healthy_empty_db_do_not_log_errors(
+        self, mem_db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    ):
+        """正常（空）資料庫回傳同樣的預設值，但不應記 ERROR，避免把「沒資料」誤報成錯誤。"""
+        caplog.set_level(logging.DEBUG, logger=_APP_LOGGER)
+        assert get_spec_groups(mem_db, "GPU") == DEFAULT_SPEC_GROUPS["GPU"]
+        assert get_representative_product(mem_db, "RTX 4060 Ti 16G") is None
+        assert get_filtered_listings(mem_db, "RTX 4060 Ti 16G") == []
+        assert _app_errors(caplog) == []
+
+    def test_dirty_row_values_do_not_trigger_boundary(
+        self, mem_db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    ):
+        """seller_type／warranty_status 為 None 的髒資料（ERR-007）要正常處理，不能靠邊界例外變成空清單。"""
+        caplog.set_level(logging.ERROR, logger=_APP_LOGGER)
+        upsert_used_listing(
+            mem_db,
+            {
+                "post_id": "dirty1",
+                "spec_group": "RTX 4060 Ti 16G",
+                "source_platform": "PTT",
+                "seller_name": "U",
+                "seller_type": None,
+                "used_asking_price": 0,
+                "warranty_status": None,
+                "post_time": "2026-11-01 10:00:00",
+            },
+        )
+        res = get_filtered_listings(mem_db, "RTX 4060 Ti 16G", exclude_workshops=True, only_in_warranty=False)
+        assert [r["post_id"] for r in res] == ["dirty1"]
+        assert _app_errors(caplog) == []
+
+    @pytest.mark.parametrize(
+        "warranty, kept",
+        [("終保", True), ("終身保固", True), ("原廠保內", True), ("保固中", True), ("過保", False), ("", False)],
+    )
+    def test_only_in_warranty_keyword_matching(
+        self, mem_db: sqlite3.Connection, warranty: str, kept: bool
+    ):
+        """保固篩選用關鍵字包含，涵蓋「終保／終身」（ERR-008、ERR-010）。"""
+        upsert_used_listing(
+            mem_db,
+            {
+                "post_id": "w1",
+                "spec_group": "DDR5-6000 32G",
+                "source_platform": "PTT",
+                "seller_name": "U",
+                "seller_type": "個人自售",
+                "used_asking_price": 2800,
+                "warranty_status": warranty,
+                "post_time": "2026-11-01 10:00:00",
+            },
+        )
+        res = get_filtered_listings(mem_db, "DDR5-6000 32G", exclude_workshops=False, only_in_warranty=True)
+        assert (len(res) == 1) is kept
+
+
+class TestSetPageConfigExceptionHandling:
+    """main() 的 st.set_page_config 只略過 StreamlitAPIException，其他例外不得被吞掉。"""
+
+    @pytest.fixture(autouse=True)
+    def isolated_db(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HARDWARE_DB_PATH", str(tmp_path / "apptest.db"))
+
+    @pytest.fixture
+    def app_file_path(self) -> str:
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(root_dir, "app", "main_app.py")
+
+    def test_streamlit_api_exception_is_ignored(self, app_file_path: str):
+        """set_page_config 拋 StreamlitAPIException → 略過，頁面照常渲染。"""
+        with patch(
+            "streamlit.set_page_config",
+            side_effect=StreamlitAPIException("set_page_config() can only be called once"),
+        ) as mock_cfg:
+            at = AppTest.from_file(app_file_path)
+            at.run()
+        assert mock_cfg.called
+        assert len(at.exception) == 0
+        assert "電腦硬體新品與二手市場比價分析系統" in at.title[0].value
+
+    def test_other_exception_is_not_swallowed(self, app_file_path: str):
+        """set_page_config 拋非 StreamlitAPIException（例如 RuntimeError）→ 不可被略過，AppTest 要看到例外。"""
+        with patch("streamlit.set_page_config", side_effect=RuntimeError("unexpected")):
+            at = AppTest.from_file(app_file_path)
+            at.run()
+        assert len(at.exception) == 1
+        assert "unexpected" in at.exception[0].message
+
+
+def test_app_module_imports_from_foreign_cwd(tmp_path):
+    """ERR-011：在別的工作目錄、沒有 PYTHONPATH 的隔離模式下載入 app/main_app.py，模組層級的 import 不可失敗。"""
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    app_path = os.path.join(root_dir, "app", "main_app.py")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["HARDWARE_DB_PATH"] = str(tmp_path / "never_opened.db")
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", "import runpy, sys; runpy.run_path(sys.argv[1], run_name='not_main')", app_path],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert not (tmp_path / "never_opened.db").exists()
 

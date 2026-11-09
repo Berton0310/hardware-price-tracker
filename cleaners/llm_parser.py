@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -14,6 +15,8 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_ENV_PATH)
@@ -376,6 +379,7 @@ def parse_post_with_llm(
             timeout=timeout,
         )
         if resp.status_code != 200:
+            logger.warning("LLM API 回應 HTTP %s（模型 %s），改用正則 fallback", resp.status_code, payload.get("model"))
             return fallback_regex_parse(title, content)
 
         data = resp.json()
@@ -400,5 +404,14 @@ def parse_post_with_llm(
             "trade_method": str(parsed.get("trade_method") or fb["trade_method"]),
             "condition_notes": str(parsed.get("condition_notes") or fb["condition_notes"]),
         }
-    except Exception:
+    except (
+        requests.exceptions.RequestException,
+        ValueError,
+        KeyError,
+        IndexError,
+        TypeError,
+        AttributeError,
+        OverflowError,
+    ) as e:
+        logger.warning("LLM 解析失敗，改用正則 fallback：%s", e)
         return fallback_regex_parse(title, content)

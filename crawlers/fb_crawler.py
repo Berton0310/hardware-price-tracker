@@ -45,7 +45,11 @@ def _parse_cookie_file(cookie_path: str) -> list[dict[str, Any]]:
         # 嘗試 JSON 解析
         if content.startswith("[") or content.startswith("{"):
             data = json.loads(content)
-            return data if isinstance(data, list) else [data]
+            items = data if isinstance(data, list) else [data]
+            valid = [c for c in items if isinstance(c, dict)]
+            if len(valid) != len(items):
+                logger.warning(f"Cookie 檔案 ({actual_path}) 有 {len(items) - len(valid)} 筆不是物件，已略過")
+            return valid
 
         # 嘗試 Netscape .txt 分割解析
         cookies = []
@@ -65,11 +69,11 @@ def _parse_cookie_file(cookie_path: str) -> list[dict[str, Any]]:
                 }
                 try:
                     c_dict["expires"] = float(expires)
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    logger.warning(f"Cookie {name} 的 expires 無法解析，略過該欄位：{expires!r}")
                 cookies.append(c_dict)
         return cookies
-    except Exception as e:
+    except (OSError, ValueError) as e:
         logger.warning(f"讀取 Cookie 檔案失敗 ({actual_path})：{e}")
         return []
 
@@ -90,10 +94,12 @@ def _load_cookies_into_context(context: Any, cookie_path: str) -> bool:
     cookies = _parse_cookie_file(cookie_path)
     if not cookies:
         return False
+    from playwright.sync_api import Error as PlaywrightError
+
     try:
         context.add_cookies(cookies)
         return True
-    except Exception as e:
+    except PlaywrightError as e:
         logger.warning(f"載入 Cookie 至 Context 失敗：{e}")
         return False
 
@@ -108,6 +114,7 @@ def crawl_fb_group(
     """爬取 Facebook 社團貼文清單，若無 Cookie 則自動切換為公開模式或優雅返回。"""
     # 延遲導入 Playwright 避免在未安裝環境中直接報錯
     try:
+        from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
     except ImportError:
         logger.warning("未安裝 Playwright，跳過 Facebook 社團爬蟲。")
@@ -142,7 +149,7 @@ def crawl_fb_group(
 
             try:
                 page.goto(group_url, timeout=timeout, wait_until="domcontentloaded")
-            except Exception as e:
+            except PlaywrightError as e:
                 logger.warning(f"導向社團頁面超時或異常：{e}")
                 browser.close()
                 return []
@@ -160,8 +167,8 @@ def crawl_fb_group(
                 close_btn = page.query_selector('div[aria-label="關閉"], div[aria-label="Close"]')
                 if close_btn:
                     close_btn.click()
-            except Exception:
-                pass
+            except PlaywrightError as e:
+                logger.debug(f"關閉登入彈窗失敗（略過）：{e}")
 
             # 真人捲動與貼文收集
             scroll_count = 0
@@ -225,8 +232,8 @@ def crawl_fb_group(
                 time.sleep(sleep_time)
 
             browser.close()
-    except Exception as e:
-        logger.warning(f"Facebook 爬取過程發生異常（已安全捕獲）：{e}")
+    except Exception:
+        logger.exception("Facebook 爬取過程發生異常（已安全捕獲）")
         return posts
 
     return posts

@@ -379,3 +379,22 @@
   - 測試一律用 tmp_path／in-memory DB；真的要檢查正式資料庫時，預設 skip、以環境變數開啟，並用 `mode=ro` 唯讀連線。
   - 測試 App 時一定設定 `HARDWARE_DB_PATH`。
 
+
+---
+
+### [ERR-020] 寬鬆的 `except Exception` 與靜默降級讓 LLM 模型失效、資料錯誤無聲無息
+- **記錄日期**：2026-11-09
+- **遭遇階段**：驗證 Agent（例外處理窄化的驗收）
+- **涉及檔案**：`cleaners/llm_parser.py`, `crawlers/ptt_crawler.py`, `crawlers/fb_crawler.py`, `app/main_app.py`
+- **問題現象**：
+  - `parse_post_with_llm` 在 HTTP 非 200（含模型下架的 404，見 ERR-013）時直接改用正則 fallback，沒有任何 log；模型失效後每一篇都悄悄降級。
+  - PTT 抓取用 `except Exception: continue/break`，程式 bug 也被當成網路錯誤跳過；FB cookie 的 expires 解析失敗 `pass`。
+  - LLM 回傳 `{"used_asking_price": Infinity}` 時 `int(inf)` 拋 OverflowError；cookie 檔是 `[1, 2]` 這類非物件陣列時 `check_fb_cookie_health` 拋 AttributeError。
+- **根本原因 (Root Cause)**：為了「不讓批次中斷」把所有例外都吞掉，而且降級路徑不留紀錄，導致真正的故障與程式 bug 都看不見。
+- **修復方案 (Resolution)**：
+  - 函式內部只捕捉具體例外並記 warning；`services/`、CLI、UI 資料載入、整次爬取最外層這些「邊界」才可捕捉 `Exception`，且一律 `logger.exception`／`logger.warning`。
+  - LLM 非 200 時記 warning（含狀態碼與模型名稱）；捕捉清單加入 `OverflowError`；cookie JSON 陣列中非物件的項目略過並 warning。
+- **回歸測試**：`tests/test_llm_parser.py::TestParsePostWithLLMExceptionHandling`、`tests/test_crawlers.py::TestPttExceptionHandling`、`TestFbCookieFileExceptionHandling`、`TestFbCrawlExceptionHandling`、`tests/test_app.py::TestDataLoaderBoundaryLogging`。
+- **預防規範 (Prevention Rule)**：
+  - 任何降級（fallback、跳過、回傳預設值）都要留下 log；非預期例外必須往外拋到邊界。
+- **已同步規則檔**：`AGENTS.md`（例外處理兩層規則）、`.agents/rules/crawlers.md`
